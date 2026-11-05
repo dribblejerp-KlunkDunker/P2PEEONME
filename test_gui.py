@@ -1,16 +1,17 @@
-"""Real Tk GUI smoke test; requires a display (Xvfb on Linux).
+"""Real-display GUI smoke test. File-dialog results are controlled.
 
-Exercises actual application callbacks and local TLS transfer. File-picker
-return values are controlled so CI does not need a human dialog selection.
-This does not establish native file-dialog, WAN, or Chromebook compatibility.
+Uses the actual Tk widgets and transfer implementation. A pass does not
+establish native dialog, Chromebook, cross-machine, or WAN compatibility.
 """
+import contextlib
+from pathlib import Path
 import tempfile
 import time
+import traceback
 import tkinter as tk
 from tkinter import ttk, filedialog
 import unittest
 from unittest import mock
-from pathlib import Path
 
 import p2peeonme as app
 
@@ -23,13 +24,57 @@ def descendants(widget):
     return result
 
 
+def destroy_safely(root):
+    with contextlib.suppress(tk.TclError):
+        root.destroy()
+
+
 class DesktopGuiTests(unittest.TestCase):
     def test_window_controls_and_local_transfer(self):
-        failures, roots, shares = [], [], []
-        checks = []
-        original_tk = tk.Tk
-        original_share = app.Share
-        deadline = time.monotonic() + 30
+        roots, shares, failures, checks = [], [], [], []
+        original_tk, original_share = tk.Tk, app.Share
+        deadline = time.monotonic() + 60
+        phase = ['startup']
+        callbacks = []
+
+        def record_failure(error):
+            failures.append(f'{phase[0]}: {error}')
+            for root in roots:
+                with contextlib.suppress(tk.TclError):
+                    root.quit()
+
+        def callback_exception(kind, value, trace):
+            record_failure(''.join(traceback.format_exception(kind, value, trace)))
+
+        def schedule(fn):
+            def guarded():
+                try:
+                    if time.monotonic() >= deadline:
+                        raise AssertionError(f'Timed out waiting for {phase[0]}')
+                    fn()
+                except Exception:
+                    record_failure(traceback.format_exc())
+            callbacks.append(roots[0].after(100, guarded))
+
+        def factory(*args, **kwargs):
+            root = original_tk(*args, **kwargs)
+            roots.append(root)
+            root.report_callback_exception = callback_exception
+            callbacks.append(root.after(60000, lambda: record_failure('GUI watchdog timeout')))
+            schedule(begin)
+            return root
+
+        def tracked_share(*args, **kwargs):
+            share = original_share(*args, **kwargs)
+            shares.append(share)
+            return share
+
+        def button(parent, label):
+            matches = [w for w in descendants(parent)
+                       if isinstance(w, ttk.Button) and str(w.cget('text')) == label]
+            self.assertEqual(len(matches), 1, f'Expected one button: {label}')
+            return matches[0]
+
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             source = directory / 'gui-fixture.bin'
@@ -38,76 +83,50 @@ class DesktopGuiTests(unittest.TestCase):
             destination = directory / 'received'
             destination.mkdir()
 
-            def tracked_share(*args, **kwargs):
-                share = original_share(*args, **kwargs)
-                shares.append(share)
-                return share
-
-            def fail(error):
-                failures.append(str(error))
-                for root in roots:
-                    if root.winfo_exists():
-                        root.destroy()
-
-            def guarded(callback):
-                def run():
-                    try:
-                        if time.monotonic() > deadline:
-                            raise AssertionError('GUI smoke test timed out')
-                        callback()
-                    except Exception as error:
-                        fail(error)
-                return run
-
-            def factory(*args, **kwargs):
-                root = original_tk(*args, **kwargs)
-                roots.append(root)
-                root.report_callback_exception = lambda kind, value, trace: fail(value)
-                root.after(150, guarded(begin))
-                root.after(30000, lambda: fail('GUI watchdog timeout'))
-                return root
-
-            def button(parent, label):
-                return next(w for w in descendants(parent)
-                            if isinstance(w, ttk.Button) and w.cget('text') == label)
-
             def begin():
                 root = roots[0]
                 root.update_idletasks()
+                if not root.winfo_ismapped():
+                    schedule(begin)
+                    return
                 self.assertEqual(root.title(), 'P2PEEONME — experimental file transfer')
-                self.assertTrue(root.winfo_ismapped())
                 notebook = next(w for w in descendants(root) if isinstance(w, ttk.Notebook))
                 self.assertEqual([notebook.tab(t, 'text') for t in notebook.tabs()], ['Send', 'Receive'])
-                sender = notebook.nametowidget(notebook.tabs()[0])
-                receiver = notebook.nametowidget(notebook.tabs()[1])
-                entries = [w for w in descendants(sender) if isinstance(w, ttk.Entry)]
-                self.assertEqual(entries[1].get(), '127.0.0.1')
-                self.assertEqual(entries[2].get(), '127.0.0.1')
+                self.notebook = notebook
+                self.sender = notebook.nametowidget(notebook.tabs()[0])
+                self.receiver = notebook.nametowidget(notebook.tabs()[1])
+                entries = [w for w in descendants(self.sender) if isinstance(w, ttk.Entry)]
+                self.assertEqual([w.get() for w in entries[1:]], ['127.0.0.1', '127.0.0.1'])
                 with mock.patch.object(filedialog, 'askopenfilename', return_value=str(source)):
-                    button(sender, 'Choose file').invoke()
+                    button(self.sender, 'Choose file').invoke()
                 self.assertEqual(entries[0].get(), str(source))
-                self.sender, self.receiver, self.notebook = sender, receiver, notebook
-                self.invitation = next(w for w in descendants(sender) if isinstance(w, tk.Text))
-                self.log = next(w for w in descendants(root) if isinstance(w, tk.Text)
-                                and w not in descendants(notebook))
+                self.invitation = next(w for w in descendants(self.sender) if isinstance(w, tk.Text))
+                tab_widgets = descendants(notebook)
+                self.log = next(w for w in descendants(root)
+                                if isinstance(w, tk.Text) and w not in tab_widgets)
                 checks.append('window, branding, tabs, defaults, file selection')
-                button(sender, 'Index and start sharing').invoke()
-                root.after(100, guarded(wait_for_invitation))
+                phase[0] = 'share startup'
+                button(self.sender, 'Index and start sharing').invoke()
+                schedule(wait_for_invitation)
+
+            def assert_no_app_error():
+                log = self.log.get('1.0', 'end')
+                self.assertNotIn('Error:', log, 'Application reported an error: ' + log)
+                return log
 
             def wait_for_invitation():
+                assert_no_app_error()
                 root = roots[0]
                 code = self.invitation.get('1.0', 'end').strip()
                 if not code:
-                    if 'Error:' in self.log.get('1.0', 'end'):
-                        raise AssertionError('Sharing failed: ' + self.log.get('1.0', 'end'))
-                    root.after(100, guarded(wait_for_invitation))
+                    schedule(wait_for_invitation)
                     return
                 self.assertTrue(code.startswith('pee1.'))
                 button(self.sender, 'Copy invitation').invoke()
                 self.assertEqual(root.clipboard_get(), code)
                 self.notebook.select(self.receiver)
                 root.update_idletasks()
-                self.assertEqual(self.notebook.select(), str(self.receiver))
+                self.assertEqual(str(self.notebook.select()), str(self.receiver))
                 text = next(w for w in descendants(self.receiver) if isinstance(w, tk.Text))
                 text.insert('1.0', code)
                 with mock.patch.object(filedialog, 'askdirectory', return_value=str(destination)):
@@ -115,17 +134,15 @@ class DesktopGuiTests(unittest.TestCase):
                 entry = next(w for w in descendants(self.receiver)
                              if isinstance(w, ttk.Entry) and not isinstance(w, ttk.Spinbox))
                 self.assertEqual(entry.get(), str(destination))
-                checks.append('real share startup, invitation, clipboard, tab switch, destination')
+                checks.append('real share startup, invitation, clipboard, destination')
+                phase[0] = 'GUI-driven transfer'
                 button(self.receiver, 'Download / resume').invoke()
-                root.after(100, guarded(wait_for_completion))
+                schedule(wait_for_completion)
 
             def wait_for_completion():
-                root = roots[0]
-                log = self.log.get('1.0', 'end')
-                if 'Error:' in log:
-                    raise AssertionError('GUI transfer failed: ' + log)
+                log = assert_no_app_error()
                 if 'Complete:' not in log:
-                    root.after(100, guarded(wait_for_completion))
+                    schedule(wait_for_completion)
                     return
                 outputs = list(destination.glob('P2PEEONME-*/gui-fixture.bin'))
                 self.assertEqual(len(outputs), 1)
@@ -133,22 +150,35 @@ class DesktopGuiTests(unittest.TestCase):
                 button(self.receiver, 'Pause safely').invoke()
                 self.notebook.select(self.sender)
                 button(self.sender, 'Stop sharing').invoke()
-                checks.append('GUI-driven TLS transfer, exact output, idle pause, stop sharing callback')
-                root.after(700, root.destroy)
+                phase[0] = 'server shutdown'
+                schedule(wait_for_shutdown)
+
+            def wait_for_shutdown():
+                assert_no_app_error()
+                self.assertEqual(len(shares), 1)
+                if shares[0].thread.is_alive() or shares[0].server.fileno() != -1:
+                    schedule(wait_for_shutdown)
+                    return
+                checks.append('verified TLS output, idle pause, completed server shutdown')
+                roots[0].quit()
 
             try:
                 with mock.patch.object(tk, 'Tk', side_effect=factory), mock.patch.object(app, 'Share', side_effect=tracked_share):
                     app.gui()
             finally:
                 for share in shares:
-                    share.stop()
-                for root in roots:
                     try:
-                        root.destroy()
-                    except tk.TclError:
-                        pass
+                        if share.server.fileno() != -1:
+                            share.stop()
+                    except Exception:
+                        failures.append('Cleanup: ' + traceback.format_exc())
+                for root in roots:
+                    for callback in callbacks:
+                        with contextlib.suppress(tk.TclError):
+                            root.after_cancel(callback)
+                    destroy_safely(root)
             self.assertFalse(failures, '\n'.join(failures))
-            self.assertEqual(len(checks), 3, 'GUI did not finish all stages')
+            self.assertEqual(len(checks), 3, 'Not all GUI stages completed')
             for check in checks:
                 print('PASS:', check)
 
