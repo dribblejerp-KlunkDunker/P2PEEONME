@@ -1,0 +1,83 @@
+name: Desktop GUI tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gui-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    name: GUI and transfer tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Linux Tk and virtual display
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-tk python3-venv xvfb xauth
+          /usr/bin/python3 -m venv .venv
+      - name: Set up Windows Python
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Create Windows environment
+        if: runner.os == 'Windows'
+        run: python -m venv .venv
+      - name: Select environment interpreter
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            echo "PYTHON=.venv/bin/python" >> "$GITHUB_ENV"
+          else
+            echo "PYTHON=.venv/Scripts/python.exe" >> "$GITHUB_ENV"
+          fi
+      - name: Install application dependencies
+        run: |
+          "$PYTHON" -m pip install -r requirements.txt
+          "$PYTHON" -c "import sys, ssl, tkinter; print(sys.version); print(ssl.OPENSSL_VERSION); print('Tk', tkinter.TkVersion)"
+      - name: Compile source and tests
+        run: '"$PYTHON" -m py_compile p2peeonme.py test_transfer.py test_gui.py'
+      - name: Run transfer tests
+        run: |
+          set -o pipefail
+          "$PYTHON" -m unittest -v test_transfer 2>&1 | tee transfer-tests.log
+      - name: Run Linux GUI test under Xvfb
+        if: runner.os == 'Linux'
+        run: |
+          set -o pipefail
+          xvfb-run -a --server-args="-screen 0 1280x1024x24" "$PYTHON" -m unittest -v test_gui 2>&1 | tee gui-tests.log
+      - name: Run Windows GUI test
+        if: runner.os == 'Windows'
+        run: |
+          set -o pipefail
+          "$PYTHON" -m unittest -v test_gui 2>&1 | tee gui-tests.log
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-test-logs-${{ matrix.os }}
+          path: |
+            transfer-tests.log
+            gui-tests.log
+          if-no-files-found: warn
+          retention-days: 7
