@@ -61,11 +61,19 @@ jobs:
         run: |
           set -o pipefail
           "$PYTHON" -m unittest discover -s . -p 'test_transfer*.py' -v 2>&1 | tee transfer-tests.log
-      - name: Run Linux GUI test under Xvfb
+      - name: Verify Xvfb and run Linux GUI tests
         if: runner.os == 'Linux'
         run: |
-          set -o pipefail
-          xvfb-run -a --server-args="-screen 0 1280x1024x24" "$PYTHON" -m unittest -v test_gui 2>&1 | tee gui-tests.log
+          set -euo pipefail
+          command -v Xvfb
+          command -v xvfb-run
+          command -v xauth
+          xvfb-run --auto-servernum --error-file=xvfb.log --server-args="-screen 0 1280x1024x24 -nolisten tcp" bash -c '
+            set -euo pipefail
+            printf "Virtual display: %s\n" "$DISPLAY"
+            "$PYTHON" -u -c "import tkinter as tk; root = tk.Tk(); root.update(); print(\"Tk window preflight passed; version\", tk.TkVersion); root.destroy()"
+            "$PYTHON" -u -m unittest -v test_gui
+          ' 2>&1 | tee gui-tests.log
       - name: Run Windows GUI test
         if: runner.os == 'Windows'
         run: |
@@ -79,5 +87,6 @@ jobs:
           path: |
             transfer-tests.log
             gui-tests.log
+            xvfb.log
           if-no-files-found: warn
           retention-days: 7
