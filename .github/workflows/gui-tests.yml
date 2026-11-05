@@ -56,11 +56,11 @@ jobs:
           "$PYTHON" -m pip install -r requirements.txt
           "$PYTHON" -c "import sys, ssl, tkinter; print(sys.version); print(ssl.OPENSSL_VERSION); print('Tk', tkinter.TkVersion)"
       - name: Compile source and tests
-        run: '"$PYTHON" -m py_compile p2peeonme.py test_transfer.py test_gui.py'
+        run: '"$PYTHON" -m py_compile p2peeonme.py test_transfer.py test_transfer_extra.py test_gui.py'
       - name: Run transfer tests
         run: |
           set -o pipefail
-          "$PYTHON" -m unittest -v test_transfer 2>&1 | tee transfer-tests.log
+          "$PYTHON" -m unittest discover -s . -p 'test_transfer*.py' -v 2>&1 | tee transfer-tests.log
       - name: Run Linux GUI test under Xvfb
         if: runner.os == 'Linux'
         run: |
